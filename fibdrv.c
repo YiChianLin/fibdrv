@@ -4,8 +4,10 @@
 #include <linux/init.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/vmalloc.h> /* vmalloc */
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -17,26 +19,139 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 500
 
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
+char test_buffer[] = "testing writing";
+
+/*fast doubling method*/
 static long long fib_sequence(long long k)
 {
-    /* FIXME: C99 variable-length array (VLA) is not allowed in Linux kernel. */
-    long long f[k + 2];
+    if (k < 2)
+        return k;
 
+    long long f[2];
     f[0] = 0;
     f[1] = 1;
 
-    for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+    for (unsigned int i = 1U << 31; i; i >>= 1) {
+        long long k1 = f[0] * (f[1] * 2 - f[0]);
+        long long k2 = f[0] * f[0] + f[1] * f[1];
+        if (k & i) {
+            f[0] = k2;
+            f[1] = k1 + k2;
+        } else {
+            f[0] = k1;
+            f[1] = k2;
+        }
+    }
+    return f[0];
+}
+/*with ctz macro*/
+static long long fib_fast_ctz(long long k)
+{
+    if (k < 2)
+        return k;
+
+    long long f[2];
+    f[0] = 0;
+    f[1] = 1;
+
+    for (unsigned int i = 1U << (31 - __builtin_clz(k)); i; i >>= 1) {
+        long long k1 = f[0] * (f[1] * 2 - f[0]);
+        long long k2 = f[0] * f[0] + f[1] * f[1];
+        if (k & i) {
+            f[0] = k2;
+            f[1] = k1 + k2;
+        } else {
+            f[0] = k1;
+            f[1] = k2;
+        }
+    }
+    return f[0];
+}
+/* origin method */
+static long long fib_iter(long long k)
+{
+    /* FIXME: C99 variable-length array (VLA) is not allowed in Linux kernel. */
+    unsigned long long result, f0 = 0, f1 = 1;
+
+    for (int i = 2; i < k; i++) {
+        result = f0 + f1;
+        f0 = f1;
+        f1 = result;
+    }
+    return result;
+}
+
+/* strlen() can't be used */
+static int my_strlen(char *x)
+{
+    int count = 0;
+    while (*x != '\0') {
+        count++;
+        x++;
+    }
+    return count;
+}
+
+static char fib_big_num(long long k, const char *buf)
+{
+    char *fib1 = vmalloc(sizeof(char) * 2);
+    char *fib0 = vmalloc(sizeof(char) * 2);
+    fib0[0] = '0';
+    fib0[1] = '\0';
+    fib1[0] = '1';
+    fib1[1] = '\0';
+
+    if (k == 0) {
+        copy_to_user(buf, fib0, 2);
+        return 1;
+    }
+    if (k == 1) {
+        copy_to_user(buf, fib1, 2);
+        return 1;
     }
 
-    return f[k];
+    int carry = 0;
+    int sum = 0;
+    int i = 1;
+    while (i < k) {
+        size_t len1 = my_strlen(fib0);
+        size_t len2 = my_strlen(fib1);
+        int len3 = 128;
+
+        char *result = vmalloc(sizeof(char) * 128);
+
+        while (len1 || len2) {
+            if (len1) {
+                sum += (fib0[--len1] - '0');
+            }
+
+            if (len2) {
+                sum += (fib1[--len2] - '0');
+            }
+            sum += carry;
+            result[--len3] = (sum % 10) + '0';
+            carry = sum / 10;
+            sum = 0;
+        }
+        if (carry)
+            result[--len3] = 1 + '0';
+        carry = 0;
+
+        fib0 = fib1;
+        fib1 = result + len3;
+        i++;
+        copy_to_user(buf, result + len3, 128 - len3 + 1);
+    }
+    vfree(fib0);
+    vfree(fib1);
+    return 1;
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -60,7 +175,7 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    return (ssize_t) fib_big_num(*offset, buf);
 }
 
 /* write operation is skipped */
@@ -69,7 +184,31 @@ static ssize_t fib_write(struct file *file,
                          size_t size,
                          loff_t *offset)
 {
-    return 1;
+    ktime_t kt;
+    switch (size) {
+    /*origin method*/
+    case 1:
+        kt = ktime_get();
+        fib_iter(*offset);
+        kt = ktime_sub(ktime_get(), kt);
+        break;
+    /*fast doubling*/
+    case 2:
+        kt = ktime_get();
+        fib_sequence(*offset);
+        kt = ktime_sub(ktime_get(), kt);
+        break;
+    /*fast doubling with ctz macro*/
+    case 3:
+        kt = ktime_get();
+        fib_fast_ctz(*offset);
+        kt = ktime_sub(ktime_get(), kt);
+        break;
+    default:
+        return 1;
+    }
+
+    return (ssize_t) ktime_to_ns(kt);
 }
 
 static loff_t fib_device_lseek(struct file *file, loff_t offset, int orig)
